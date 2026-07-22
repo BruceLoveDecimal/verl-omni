@@ -353,12 +353,7 @@ class BagelPipelineWithLogProb(BagelPipeline):
 
         return DiffusionOutput(
             output=maybe_to_cpu(output.output),
-            custom_output={
-                "all_latents": maybe_to_cpu(traj_latents.unsqueeze(0)) if traj_latents is not None else None,
-                "all_timesteps": maybe_to_cpu(traj_timesteps.unsqueeze(0)) if traj_timesteps is not None else None,
-                "all_log_probs": maybe_to_cpu(traj_log_probs.unsqueeze(0)) if traj_log_probs is not None else None,
-            },
-            trajectory_latents=None,
-            trajectory_timesteps=None,
-            trajectory_log_probs=None,
+            trajectory_latents=maybe_to_cpu(traj_latents.unsqueeze(0)) if traj_latents is not None else None,
+            trajectory_timesteps=maybe_to_cpu(traj_timesteps.unsqueeze(0)) if traj_timesteps is not None else None,
+            trajectory_log_probs=maybe_to_cpu(traj_log_probs.unsqueeze(0)) if traj_log_probs is not None else None,
         )

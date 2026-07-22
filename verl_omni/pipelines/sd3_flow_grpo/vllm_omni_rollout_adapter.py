@@ -24,7 +24,8 @@ import torch
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.sd3.pipeline_sd3 import StableDiffusion3Pipeline
-from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
@@ -114,9 +115,11 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
     - the Euler flow-match scheduler is replaced by
       :class:`FlowMatchSDEDiscreteScheduler` so SDE-window sampling produces
       per-step log-probabilities;
-    - ``forward`` collects ``all_latents`` / ``all_log_probs`` /
-      ``all_timesteps`` and ships prompt embeddings (sequence + pooled)
-      through ``custom_output`` for training-side log-prob recomputation;
+    - ``forward`` collects the rollout trajectory into the
+      ``trajectory_latents`` / ``trajectory_log_probs`` /
+      ``trajectory_timesteps`` output fields and ships prompt embeddings
+      (sequence + pooled) through ``output["metadata"]["prompt_embeddings"]``
+      for training-side log-prob recomputation;
     - CFG is plain SD3 guidance (``guidance_scale``); the convergence-test
       default is non-CFG (``guidance_scale <= 1`` skips the negative branch
       entirely, halving the transformer NFE).
@@ -285,9 +288,13 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
         all_timesteps = torch.stack(all_timesteps).unsqueeze(0).expand(latents.shape[0], -1)
         return latents, all_latents, all_log_probs, all_timesteps
 
+    # The overridden forward() consumes a single request; opt out of the
+    # upstream request-batch fast path.
+    supports_request_batch = False
+
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -312,7 +319,7 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
 
         if prompt is None:
             # Engine warm-up / dummy run without a usable prompt.
-            return DiffusionOutput(output=None, custom_output={})
+            return DiffusionOutput(output=None)
         if isinstance(prompt, str):
             prompt = [prompt]
 
@@ -399,7 +406,7 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
 
         if req.request_id == DUMMY_DIFFUSION_REQUEST_ID and sde_window[0] == sde_window[1]:
             image = self._decode_latents(latents)
-            return DiffusionOutput(output=image, custom_output={}, to_cpu=True)
+            return DiffusionOutput(output=image, to_cpu=True)
 
         latents, all_latents, all_log_probs, all_timesteps = self.diffuse(
             prompt_embeds,
@@ -421,17 +428,21 @@ class StableDiffusion3PipelineWithLogProb(StableDiffusion3Pipeline):
         image = self._decode_latents(latents)
 
         return DiffusionOutput(
-            output=image,
-            custom_output={
-                "all_latents": all_latents,
-                "all_log_probs": all_log_probs,
-                "all_timesteps": all_timesteps,
-                "prompt_embeds": prompt_embeds,
-                "prompt_embeds_mask": prompt_embeds_mask,
-                "pooled_prompt_embeds": pooled_prompt_embeds,
-                "negative_prompt_embeds": negative_prompt_embeds,
-                "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
-                "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
+            output={
+                "payload": {"image": image},
+                "metadata": {
+                    "prompt_embeddings": {
+                        "prompt_embeds": prompt_embeds,
+                        "prompt_embeds_mask": prompt_embeds_mask,
+                        "pooled_prompt_embeds": pooled_prompt_embeds,
+                        "negative_prompt_embeds": negative_prompt_embeds,
+                        "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+                        "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
+                    },
+                },
             },
+            trajectory_latents=all_latents,
+            trajectory_log_probs=all_log_probs,
+            trajectory_timesteps=all_timesteps,
             to_cpu=True,
         )

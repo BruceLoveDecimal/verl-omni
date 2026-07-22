@@ -447,8 +447,25 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         else:
             diffusion_output = self._to_tensor(diffusion_output).float() / 255.0
 
-        # Extract extra data from custom_output (populated by DiffusionEngine)
-        mm_output = final_res.custom_output or {}
+        # Rebuild the flat rollout-extras dict from the vllm-omni >=0.25 output
+        # channels: trajectories ride first-class ``trajectory_*`` fields and
+        # everything else (prompt embeddings, model-specific extras) rides
+        # ``multimodal_output["metadata"]``. The legacy ``custom_output`` dict
+        # is merged first so older pipelines keep working.
+        mm_output = dict(final_res.custom_output or {})
+        metadata = (final_res.multimodal_output or {}).get("metadata") or {}
+        for key, value in (metadata.get("prompt_embeddings") or {}).items():
+            mm_output.setdefault(key, value)
+        for key, value in metadata.items():
+            if key != "prompt_embeddings":
+                mm_output.setdefault(key, value)
+        for key, value in (
+            ("all_latents", final_res.trajectory_latents),
+            ("all_log_probs", final_res.trajectory_log_probs),
+            ("all_timesteps", final_res.trajectory_timesteps),
+        ):
+            if value is not None:
+                mm_output.setdefault(key, value)
 
         if sampling_params.get("logprobs", False):
             all_log_probs = mm_output.get("all_log_probs")

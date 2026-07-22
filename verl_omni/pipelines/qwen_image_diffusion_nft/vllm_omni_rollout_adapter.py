@@ -18,8 +18,8 @@ from typing import Any
 import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.size_utils import normalize_min_aligned_size
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import (
@@ -35,10 +35,15 @@ __all__ = ["QwenImageDiffusionNFTPipeline"]
 class QwenImageDiffusionNFTPipeline(QwenImageTokenIdPromptMixin, QwenImagePipeline):
     """Rollout pipeline for Qwen-Image used by DiffusionNFT.
 
+    The overridden ``forward()`` consumes a single request, so the upstream
+    request-batch fast path is disabled via ``supports_request_batch``.
+
     DiffusionNFT trains from the final clean latent with a forward-process
     objective, so the rollout side does not collect reverse-SDE trajectories or
     log-probabilities.
     """
+
+    supports_request_batch = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -154,7 +159,7 @@ class QwenImageDiffusionNFTPipeline(QwenImageTokenIdPromptMixin, QwenImagePipeli
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt_ids: torch.Tensor | list[int] | None = None,
         prompt_mask: torch.Tensor | None = None,
         negative_prompt_ids: torch.Tensor | list[int] | None = None,
@@ -206,7 +211,7 @@ class QwenImageDiffusionNFTPipeline(QwenImageTokenIdPromptMixin, QwenImagePipeli
             num_images_per_prompt = req_num_outputs
 
         if prompt_ids is None and prompt_embeds is None:
-            return DiffusionOutput(output=None, custom_output={})
+            return DiffusionOutput(output=None)
 
         ctx = self._prepare_token_id_generation_context(
             prompt_ids=prompt_ids,
@@ -256,14 +261,18 @@ class QwenImageDiffusionNFTPipeline(QwenImageTokenIdPromptMixin, QwenImagePipeli
         decoded = self._decode_latents(latents, height, width, output_type or "pil")
 
         return DiffusionOutput(
-            output=decoded.output,
-            custom_output={
-                "latents_clean": latents_clean,
-                "train_timesteps": ctx["timesteps"].unsqueeze(0).expand(latents_clean.shape[0], -1),
-                "prompt_embeds": ctx["prompt_embeds"],
-                "prompt_embeds_mask": ctx["prompt_embeds_mask"],
-                "negative_prompt_embeds": ctx["negative_prompt_embeds"],
-                "negative_prompt_embeds_mask": ctx["negative_prompt_embeds_mask"],
+            output={
+                "payload": {"image": decoded.output},
+                "metadata": {
+                    "prompt_embeddings": {
+                        "prompt_embeds": ctx["prompt_embeds"],
+                        "prompt_embeds_mask": ctx["prompt_embeds_mask"],
+                        "negative_prompt_embeds": ctx["negative_prompt_embeds"],
+                        "negative_prompt_embeds_mask": ctx["negative_prompt_embeds_mask"],
+                    },
+                    "latents_clean": latents_clean,
+                    "train_timesteps": ctx["timesteps"].unsqueeze(0).expand(latents_clean.shape[0], -1),
+                },
             },
             to_cpu=True,
         )

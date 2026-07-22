@@ -22,8 +22,8 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
-from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
@@ -45,6 +45,11 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
 
     Registered under ``"QwenImagePipeline"`` for vllm-omni rollout dispatch.
     """
+
+    # The overridden forward() consumes a single request (req.prompts[0]);
+    # opt out of the upstream request-batch fast path so the runner calls it
+    # once per request.
+    supports_request_batch = False
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
@@ -183,9 +188,9 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
 
     def prepare_encode(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         **kwargs: Any,
-    ) -> "DiffusionRequestState":
+    ) -> "StepRequestState":
         """Populate *state* with encoded prompts, latents, timesteps, and CFG config.
 
         Override of ``QwenImagePipeline.prepare_encode`` that accepts pre-tokenized
@@ -193,7 +198,7 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
         matching the input contract of ``QwenImagePipelineWithLogProb``.
         """
         sampling = state.sampling
-        # vllm-omni >=0.24 stores a single prompt on DiffusionRequestState.prompt
+        # vllm-omni >=0.24 stores a single prompt on StepRequestState.prompt
         # (not .prompts). Match upstream QwenImagePipeline.prepare_encode.
         prompt_ids, prompt_mask, negative_prompt_ids, negative_prompt_mask = self._extract_prompt_ids(
             [state.prompt] if state.prompt is not None else []
@@ -323,7 +328,7 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
         # from the same RNG stream as ``forward()``.
         state.sampling.generator = generator
         # Rollout / SDE state consumed by ``step_scheduler`` and packaged
-        # into ``custom_output`` by ``post_decode``.
+        # into trajectory fields / output metadata by ``post_decode``.
         state.sde_window = sde_window
         state.noise_level = noise_level
         state.sde_type = sde_type
@@ -468,7 +473,7 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
 
     def step_scheduler(
         self,
-        state: DiffusionRequestState,
+        state: StepRequestState,
         noise_pred: torch.Tensor,
         **kwargs: Any,
     ) -> None:
@@ -565,7 +570,7 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
 
     def post_decode(
         self,
-        state: DiffusionRequestState,
+        state: StepRequestState,
         **kwargs: Any,
     ) -> DiffusionOutput:
         """Decode final latents, package rollout trajectory, and move to CPU.
@@ -574,12 +579,12 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
         :class:`DiffusionOutput` across an inter-process MessageQueue to the
         ``vLLMOmniHttpServer`` actor.  We must (a) move tensors to CPU so the
         receiving process does not initialise a stray CUDA context on GPU 0,
-        and (b) populate ``custom_output`` with the trajectory fields that
-        :meth:`forward` produces, so downstream consumers
+        and (b) populate the ``trajectory_*`` fields and the output-envelope
+        ``metadata`` that :meth:`forward` produces, so downstream consumers
         (``vllm_omni_async_server.generate`` ->
         ``embeds_padding_2_no_padding``) receive real tensors rather than
         ``None`` (which becomes a non-tensor ``LinkedList`` in the
-        ``TensorDict`` and breaks ``mask.shape[0]``).
+        training ``TensorDict`` and breaks ``mask.shape[0]``).
         """
         output = super().post_decode(state, **kwargs)
         if not isinstance(output, DiffusionOutput):
@@ -599,21 +604,26 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
 
         return replace(
             output,
-            custom_output={
-                "all_latents": stacked_latents,
-                "all_log_probs": stacked_log_probs,
-                "all_timesteps": stacked_timesteps,
-                "prompt_embeds": state.prompt_embeds,
-                "prompt_embeds_mask": state.prompt_embeds_mask,
-                "negative_prompt_embeds": state.negative_prompt_embeds,
-                "negative_prompt_embeds_mask": state.negative_prompt_embeds_mask,
+            output={
+                "payload": {"image": output.output},
+                "metadata": {
+                    "prompt_embeddings": {
+                        "prompt_embeds": state.prompt_embeds,
+                        "prompt_embeds_mask": state.prompt_embeds_mask,
+                        "negative_prompt_embeds": state.negative_prompt_embeds,
+                        "negative_prompt_embeds_mask": state.negative_prompt_embeds_mask,
+                    },
+                },
             },
+            trajectory_latents=stacked_latents,
+            trajectory_log_probs=stacked_log_probs,
+            trajectory_timesteps=stacked_timesteps,
             to_cpu=True,
         )
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt_token_ids: torch.Tensor | list[int] | None = None,
         prompt_mask: torch.Tensor | None = None,
         negative_prompt_ids: torch.Tensor | list[int] | None = None,
@@ -694,11 +704,11 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
             logprobs (bool): Whether to compute per-step log-probabilities.
 
         Returns:
-            DiffusionOutput: Contains the decoded *output* image and a
-                *custom_output* dict with keys ``"all_latents"``,
-                ``"all_log_probs"``, ``"all_timesteps"``, ``"prompt_embeds"``,
-                ``"prompt_embeds_mask"``, ``"negative_prompt_embeds"``, and
-                ``"negative_prompt_embeds_mask"``.
+            DiffusionOutput: Carries the decoded image in
+                ``output["payload"]["image"]``, the prompt embeddings in
+                ``output["metadata"]["prompt_embeddings"]``, and the rollout
+                trajectory in the ``trajectory_latents`` /
+                ``trajectory_log_probs`` / ``trajectory_timesteps`` fields.
         """
         custom_prompt = req.prompts[0] if req.prompts else {}
         if isinstance(custom_prompt, dict):
@@ -741,7 +751,7 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
         else:
             # Both prompt_token_ids and prompt_embeds are None (e.g. during warmup/dummy run).
             # Return a minimal dummy output to avoid crashing.
-            return DiffusionOutput(output=None, custom_output={})
+            return DiffusionOutput(output=None)
 
         if isinstance(negative_prompt_ids, list):
             negative_prompt_ids = torch.tensor(negative_prompt_ids, device=self.device)
@@ -850,15 +860,19 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
 
         return DiffusionOutput(
-            output=image,
-            custom_output={
-                "all_latents": all_latents,
-                "all_log_probs": all_log_probs,
-                "all_timesteps": all_timesteps,
-                "prompt_embeds": prompt_embeds,
-                "prompt_embeds_mask": prompt_embeds_mask,
-                "negative_prompt_embeds": negative_prompt_embeds,
-                "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+            output={
+                "payload": {"image": image},
+                "metadata": {
+                    "prompt_embeddings": {
+                        "prompt_embeds": prompt_embeds,
+                        "prompt_embeds_mask": prompt_embeds_mask,
+                        "negative_prompt_embeds": negative_prompt_embeds,
+                        "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+                    },
+                },
             },
+            trajectory_latents=all_latents,
+            trajectory_log_probs=all_log_probs,
+            trajectory_timesteps=all_timesteps,
             to_cpu=True,
         )

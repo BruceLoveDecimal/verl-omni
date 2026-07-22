@@ -20,7 +20,7 @@ import torch
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import apply_true_cfg, build_img_shapes
@@ -35,6 +35,10 @@ def _coalesce_not_none(value, default):
 @VllmOmniPipelineBase.register("QwenImagePipeline", algorithm="dpo")
 class QwenImageDPOPipeline(QwenImagePipeline):
     """Rollout pipeline that returns DPO training tensors with generated images."""
+
+    # The overridden forward() consumes a single request; opt out of the
+    # upstream request-batch fast path.
+    supports_request_batch = False
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
@@ -101,7 +105,7 @@ class QwenImageDPOPipeline(QwenImagePipeline):
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt_ids: torch.Tensor | list[int] | None = None,
         prompt_mask: torch.Tensor | None = None,
         negative_prompt_ids: torch.Tensor | list[int] | None = None,
@@ -157,7 +161,7 @@ class QwenImageDPOPipeline(QwenImagePipeline):
         elif prompt_embeds is not None:
             batch_size = prompt_embeds.shape[0]
         else:
-            return DiffusionOutput(output=None, custom_output={})
+            return DiffusionOutput(output=None)
 
         if isinstance(negative_prompt_ids, list):
             negative_prompt_ids = torch.tensor(negative_prompt_ids, device=self.device)
@@ -267,13 +271,17 @@ class QwenImageDPOPipeline(QwenImagePipeline):
         image = self.vae.decode(unpacked_latents, return_dict=False)[0][:, :, 0]
 
         return DiffusionOutput(
-            output=image,
-            custom_output={
-                "latents_clean": latents_clean,
-                "prompt_embeds": prompt_embeds,
-                "prompt_embeds_mask": prompt_embeds_mask,
-                "negative_prompt_embeds": negative_prompt_embeds,
-                "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+            output={
+                "payload": {"image": image},
+                "metadata": {
+                    "prompt_embeddings": {
+                        "prompt_embeds": prompt_embeds,
+                        "prompt_embeds_mask": prompt_embeds_mask,
+                        "negative_prompt_embeds": negative_prompt_embeds,
+                        "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+                    },
+                    "latents_clean": latents_clean,
+                },
             },
             to_cpu=True,
         )

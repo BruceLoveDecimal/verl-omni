@@ -25,7 +25,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit_plus import 
     QwenImageEditPlusPipeline,
     calculate_dimensions,
 )
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import (
@@ -308,9 +308,13 @@ class QwenImageEditPlusPipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImag
         all_timesteps = torch.stack(all_timesteps).unsqueeze(0).expand(latents.shape[0], -1)
         return latents, all_latents, all_log_probs, all_timesteps
 
+    # The overridden forward() consumes a single request; opt out of the
+    # upstream request-batch fast path.
+    supports_request_batch = False
+
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt_ids: torch.Tensor | list[int] | None = None,
         prompt_mask: torch.Tensor | None = None,
         negative_prompt_ids: torch.Tensor | list[int] | None = None,
@@ -409,7 +413,7 @@ class QwenImageEditPlusPipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImag
         elif prompt_embeds is not None:
             batch_size = prompt_embeds.shape[0]
         else:
-            return DiffusionOutput(output=None, custom_output={})
+            return DiffusionOutput(output=None)
 
         if isinstance(negative_prompt_ids, list):
             negative_prompt_ids = torch.tensor(negative_prompt_ids, device=self.device)
@@ -532,16 +536,20 @@ class QwenImageEditPlusPipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImag
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
 
         return DiffusionOutput(
-            output=_maybe_to_cpu(image),
-            custom_output={
-                "all_latents": _maybe_to_cpu(all_latents),
-                "all_log_probs": _maybe_to_cpu(all_log_probs),
-                "all_timesteps": _maybe_to_cpu(all_timesteps),
-                "prompt_embeds": _maybe_to_cpu(prompt_embeds),
-                "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
-                "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
-                "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
-                "condition_image_latents": _maybe_to_cpu(condition_image_latents),
-                "img_shapes": img_shapes,
+            output={
+                "payload": {"image": _maybe_to_cpu(image)},
+                "metadata": {
+                    "prompt_embeddings": {
+                        "prompt_embeds": _maybe_to_cpu(prompt_embeds),
+                        "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
+                        "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
+                        "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
+                    },
+                    "condition_image_latents": _maybe_to_cpu(condition_image_latents),
+                    "img_shapes": img_shapes,
+                },
             },
+            trajectory_latents=_maybe_to_cpu(all_latents),
+            trajectory_log_probs=_maybe_to_cpu(all_log_probs),
+            trajectory_timesteps=_maybe_to_cpu(all_timesteps),
         )
