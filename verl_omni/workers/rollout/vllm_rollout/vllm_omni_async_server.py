@@ -165,7 +165,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             )
             # TODO (mike): read custom_pipeline from engine_args
             if pipeline_path is not None:
-                engine_args["enable_dummy_pipeline"] = True
                 engine_args["custom_pipeline_args"] = {"pipeline_class": pipeline_path}
 
         if getattr(self.config, "step_execution", False):
