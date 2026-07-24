@@ -204,6 +204,14 @@ def build(
     components["mllm"].to(dtype).save_pretrained(os.path.join(output_dir, "mllm"))
 
     _copy_pretrained_assets(source_model, output_dir)
+    # The source checkpoint ships no processor/config.json; verl's
+    # hf_processor needs an AutoConfig next to the processor files (see
+    # BooguImage.prepare_processor_files). Use the tiny mllm config so the
+    # fixture is self-contained.
+    shutil.copyfile(
+        os.path.join(output_dir, "mllm", "config.json"),
+        os.path.join(output_dir, "processor", "config.json"),
+    )
     _write_model_index(output_dir)
     return output_dir
 

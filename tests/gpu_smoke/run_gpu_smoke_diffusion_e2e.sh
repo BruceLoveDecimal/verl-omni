@@ -65,4 +65,8 @@ run_test 5 "Online DPO Boogu-Image trainer e2e" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
     bash tests/special_e2e/run_online_dpo_boogu_image.sh
 
+run_test 6 "DiffusionNFT Boogu-Image trainer e2e" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
+    bash tests/special_e2e/run_diffusionnft_boogu_image.sh
+
 gpu_smoke_summary
