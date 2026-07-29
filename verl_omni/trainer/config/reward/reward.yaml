@@ -20,6 +20,10 @@ custom_reward_function:
   path: null
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: compute_score
+  # Any additional field set here is forwarded as a keyword argument to the reward
+  # function, as long as its signature declares it; undeclared fields are dropped.
+  # e.g. '+reward.custom_reward_function.sampling_params.temperature=0.0' tunes the
+  # generative reward model decoding used by compute_score_ocr.
 
 # Multi-reward configuration (dict-based, mutually exclusive with custom_reward_function).
 # Keys are user-chosen names used for metric logging (e.g., "ocr", "jpeg").

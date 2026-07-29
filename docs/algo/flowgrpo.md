@@ -1,6 +1,6 @@
 # Flow-GRPO
 
-Last updated: 05/13/2026.
+Last updated: 07/29/2026.
 
 Flow-GRPO ([paper](https://arxiv.org/abs/2505.05470), [code](https://github.com/yifan123/flow_grpo)) is the first method to integrate online policy gradient reinforcement learning into **flow matching** generative models (e.g., Stable Diffusion 3, FLUX). It enables direct reward optimization for tasks such as compositional text-to-image generation, visual text rendering, and human preference alignment, without modifying the standard inference pipeline.
 
@@ -208,6 +208,23 @@ ppo_micro_batch_size_per_gpu       = 16
 - `reward.custom_reward_function.path` and
   `reward.custom_reward_function.name`: Register the task-specific reward
   post-processing function such as `compute_score_ocr`.
+
+- Any other field under `reward.custom_reward_function` is forwarded as a
+  keyword argument to that function, provided its signature declares it. For
+  example, `compute_score_ocr` accepts `sampling_params`, so the GRM decoding
+  can be made greedy with:
+
+  ```bash
+  '+reward.custom_reward_function.sampling_params.temperature=0.0' \
+  '+reward.custom_reward_function.sampling_params.top_p=1.0'
+  ```
+
+  Only the keys you set are overridden; the rest keep their defaults
+  (`temperature=0.7`, `top_p=0.8`, `max_tokens=4096`). The same fields work
+  per sub-reward under `reward.reward_functions.<key>` in the multi-reward
+  setup. A dataset can also override the sampling params for individual
+  samples via the `grm_sampling_params` key of its `extra_info` column, which
+  takes precedence over the config.
 
 For an end-to-end OCR training walkthrough, including dataset preparation and
 the full runnable command, see `docs/start/flowgrpo_quickstart.md`.

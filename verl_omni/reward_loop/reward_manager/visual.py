@@ -21,6 +21,24 @@ from verl.utils.reward_score import default_compute_score as _upstream_default_c
 
 from verl_omni.utils.reward_score import default_compute_score_image
 
+# Fields of ``reward.custom_reward_function`` consumed by the loader itself; everything
+# else is treated as a keyword argument for the reward function.
+_CUSTOM_REWARD_FUNCTION_RESERVED_KEYS = {"path", "name"}
+
+
+def _filter_kwargs(all_kwargs: dict, sig: inspect.Signature) -> dict:
+    """Filter kwargs to only those declared in the function signature.
+
+    If the function accepts **kwargs, all arguments are passed through.
+    """
+    params = sig.parameters
+    # Check if the function accepts **kwargs
+    for param in params.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return all_kwargs
+    # Only pass declared parameters
+    return {k: v for k, v in all_kwargs.items() if k in params}
+
 
 class VisualRewardManager(RewardManagerBase):
     """The reward manager for visual response."""
@@ -36,6 +54,17 @@ class VisualRewardManager(RewardManagerBase):
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
         self.reward_router_address = reward_router_address
         self.reward_model_tokenizer = reward_model_tokenizer
+        self.custom_reward_kwargs = self._resolve_custom_reward_kwargs()
+
+    def _resolve_custom_reward_kwargs(self) -> dict:
+        """Extra ``reward.custom_reward_function`` fields to forward to the reward function.
+
+        Any field beyond ``path``/``name`` (e.g. ``sampling_params``) is passed as a
+        keyword argument, provided the reward function declares it.
+        """
+        custom_cfg = self.config.reward.get("custom_reward_function", None) or {}
+        extra_args = {k: v for k, v in custom_cfg.items() if k not in _CUSTOM_REWARD_FUNCTION_RESERVED_KEYS}
+        return _filter_kwargs(extra_args, inspect.signature(self.compute_score))
 
     @classmethod
     def assemble_rm_scores(cls, data: DataProto, scores: list[float]) -> torch.Tensor:
@@ -67,6 +96,7 @@ class VisualRewardManager(RewardManagerBase):
             if self.reward_router_address is not None
             else {}
         )
+        extra_reward_kwargs.update(self.custom_reward_kwargs)
         if self.is_async_reward_score:
             result = await self.compute_score(
                 data_source=data_source,

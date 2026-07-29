@@ -19,9 +19,11 @@ import logging
 from verl import DataProto
 from verl.utils.import_utils import load_extern_object
 
-from .visual import VisualRewardManager
+from .visual import VisualRewardManager, _filter_kwargs
 
 logger = logging.getLogger(__name__)
+
+__all__ = ["MultiVisualRewardManager", "_filter_kwargs", "_multi_reward_placeholder"]
 
 
 def _multi_reward_placeholder(**kwargs):
@@ -30,20 +32,6 @@ def _multi_reward_placeholder(**kwargs):
     This is never called directly; MultiVisualRewardManager overrides run_single.
     """
     raise RuntimeError("_multi_reward_placeholder should never be called directly")
-
-
-def _filter_kwargs(all_kwargs: dict, sig: inspect.Signature) -> dict:
-    """Filter kwargs to only those declared in the function signature.
-
-    If the function accepts **kwargs, all arguments are passed through.
-    """
-    params = sig.parameters
-    # Check if the function accepts **kwargs
-    for param in params.values():
-        if param.kind == inspect.Parameter.VAR_KEYWORD:
-            return all_kwargs
-    # Only pass declared parameters
-    return {k: v for k, v in all_kwargs.items() if k in params}
 
 
 class MultiVisualRewardManager(VisualRewardManager):

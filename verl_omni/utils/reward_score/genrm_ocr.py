@@ -22,6 +22,7 @@ transcription, compared to a ground truth, to produce a score in ``[0, 1]``.
 import json
 import os
 import re
+from collections.abc import Mapping
 from typing import Optional
 
 import aiohttp
@@ -36,6 +37,8 @@ DEFAULT_GRM_PROMPT = (
 )
 DEFAULT_GRM_MODEL_PATH = "~/models/tiny-random/qwen3-vl"
 DEFAULT_SAMPLING_PARAMS = {"temperature": 0.7, "top_p": 0.8, "max_tokens": 4096}
+# Key used to override the GRM sampling params per sample, via the dataset's ``extra_info`` column.
+SAMPLING_PARAMS_EXTRA_INFO_KEY = "grm_sampling_params"
 
 
 async def _chat_complete(router_address: str, chat_complete_request: dict) -> ChatCompletion:
@@ -58,6 +61,57 @@ def _to_pil(image) -> Image.Image:
         image = Image.fromarray(image)
     assert isinstance(image, Image.Image)
     return image
+
+
+def _resolve_sampling_params(
+    sampling_params: Optional[Mapping] = None,
+    extra_info: Optional[Mapping] = None,
+) -> dict:
+    """Merge sampling-param overrides on top of :data:`DEFAULT_SAMPLING_PARAMS`.
+
+    Later sources win over earlier ones:
+
+    1. :data:`DEFAULT_SAMPLING_PARAMS`;
+    2. ``sampling_params``, coming from the reward config (e.g.
+       ``+reward.custom_reward_function.sampling_params.temperature=0.0``);
+    3. ``extra_info[SAMPLING_PARAMS_EXTRA_INFO_KEY]``, a per-sample override
+       carried by the dataset.
+
+    Args:
+        sampling_params: Config-level overrides, or ``None``.
+        extra_info: Per-sample metadata that may carry
+            ``grm_sampling_params``.
+
+    Returns:
+        dict: Sampling params to splat into the chat completion request.
+
+    Raises:
+        TypeError: If an override is not a mapping.
+    """
+    resolved = dict(DEFAULT_SAMPLING_PARAMS)
+    per_sample = (extra_info or {}).get(SAMPLING_PARAMS_EXTRA_INFO_KEY)
+    for override in (sampling_params, per_sample):
+        if not override:
+            continue
+        if not isinstance(override, Mapping):
+            raise TypeError(f"GRM sampling params must be a mapping, got {type(override).__name__}: {override!r}")
+        resolved.update(override)
+    return resolved
+
+
+def _build_chat_request(image_base64: str, model_name: str, sampling_params: Mapping) -> dict:
+    """Build the OpenAI-compatible chat completion request for one image."""
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_base64}},
+                {"type": "text", "text": DEFAULT_GRM_PROMPT},
+            ],
+        },
+    ]
+    return {"messages": messages, "model": model_name, **sampling_params}
 
 
 def _levenshtein_score(text: str, ground_truth: str) -> float:
@@ -86,6 +140,7 @@ async def compute_score_ocr(
     reward_router_address: str,
     reward_model_tokenizer: PreTrainedTokenizer = None,
     model_name: Optional[str] = None,
+    sampling_params: Optional[Mapping] = None,
 ):
     """Compute an image OCR score via a generative reward model (GRM).
 
@@ -99,12 +154,17 @@ async def compute_score_ocr(
         solution_image: The solution image or video to be evaluated.
         ground_truth: The ground truth text for comparison.
         extra_info: Additional information; ``frame_interval`` controls video
-            frame subsampling.
+            frame subsampling and ``grm_sampling_params`` overrides the GRM
+            sampling params for this sample.
         reward_router_address: ``host:port`` of the GRM router.
         reward_model_tokenizer: Tokenizer for the reward model. Unused, kept
             for interface consistency.
         model_name: Name or path of the GRM. Defaults to
             ``DEFAULT_GRM_MODEL_PATH``.
+        sampling_params: Sampling params for the GRM (e.g. ``temperature``,
+            ``top_p``, ``max_tokens``), merged on top of
+            :data:`DEFAULT_SAMPLING_PARAMS`. Set from the reward config, and
+            in turn overridden by ``extra_info["grm_sampling_params"]``.
 
     Returns:
         dict: ``{"score": float, "genrm_response": str}``.
@@ -149,6 +209,7 @@ async def compute_score_ocr(
         solution_image = solution_image.reshape(-1, *solution_image.shape[2:])  # [B*F', C, H, W]
 
     model_name = model_name or os.path.expanduser(DEFAULT_GRM_MODEL_PATH)
+    resolved_sampling_params = _resolve_sampling_params(sampling_params, extra_info)
     loop = get_event_loop()
 
     grm_response = ""
@@ -157,22 +218,11 @@ async def compute_score_ocr(
         pil_image = _to_pil(image)
         image_base64 = await loop.run_in_executor(None, pil_image_to_base64, pil_image)
 
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": image_base64}},
-                    {"type": "text", "text": DEFAULT_GRM_PROMPT},
-                ],
-            },
-        ]
-        # TODO: make sampling params configurable
-        chat_complete_request = {
-            "messages": messages,
-            "model": model_name,
-            **DEFAULT_SAMPLING_PARAMS,
-        }
+        chat_complete_request = _build_chat_request(
+            image_base64=image_base64,
+            model_name=model_name,
+            sampling_params=resolved_sampling_params,
+        )
         result = await _chat_complete(
             router_address=reward_router_address,
             chat_complete_request=chat_complete_request,
