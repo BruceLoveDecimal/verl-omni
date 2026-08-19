@@ -1,5 +1,7 @@
 # Train Boogu-Image with FlowGRPO
 
+Last updated: 08/19/2026
+
 RL post-training for [Boogu-Image-0.1-Base](https://huggingface.co/Boogu/Boogu-Image-0.1-Base)
 (text-to-image) and [Boogu-Image-0.1-Edit](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit)
 (TI2I editing) with the FlowGRPO trainer. Both checkpoints share the
@@ -79,3 +81,41 @@ Model-specific constraints baked into the recipe:
   (upstream behaviour); the negative instruction itself is encoded
   text-only. Image guidance (`guidance_scale_2` / double guidance) is not
   wired up.
+
+## Tests
+
+The pipeline is guarded by model-level CPU tests, which cover the conventions
+that break RL silently rather than loudly — the velocity negation and text CFG
+that reach `scheduler.step`, the `t = 1 - sigma` timestep mapping, the float32
+trajectory rule, and the SDE-window collection contract:
+
+```bash
+pytest tests/pipelines/test_boogu_image_adapters_on_cpu.py \
+       tests/pipelines/test_boogu_image_common_on_cpu.py \
+       tests/pipelines/test_boogu_image_rollout_on_cpu.py
+```
+
+A special E2E test covers parquet loading, vLLM-Omni rollout, reward
+computation, FSDP LoRA training, and weight synchronization. Boogu-Image
+shares the Qwen-Image training path, so it is **not** wired into the GPU smoke
+suite; run it manually when touching the rollout or training adapters:
+
+```bash
+# T2I
+CUDA_VISIBLE_DEVICES=0 NUM_GPUS=1 bash tests/special_e2e/run_flowgrpo_boogu_image.sh
+# Edit (TI2I) — also exercises the reference-latent refiner path
+CUDA_VISIBLE_DEVICES=0 NUM_GPUS=1 MODE=edit bash tests/special_e2e/run_flowgrpo_boogu_image.sh
+```
+
+The script builds a tiny random checkpoint at
+`~/models/tiny-random/Boogu-Image` on first use (a no-op afterwards). The
+builder copies the processor and scheduler directories verbatim from the
+locally cached `Boogu/Boogu-Image-0.1-Base` snapshot without loading its weight
+shards — the scheduler config carries Boogu-specific time-shift keys that a
+diffusers config round-trip would drop. Use `SOURCE_MODEL` if those assets are
+stored elsewhere:
+
+```bash
+SOURCE_MODEL=/path/to/Boogu-Image-0.1-Base MODE=edit \
+bash tests/special_e2e/run_flowgrpo_boogu_image.sh
+```

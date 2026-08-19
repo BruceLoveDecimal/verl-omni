@@ -216,11 +216,13 @@ def ensure_tiny_boogu_image_checkpoint(
     output_dir: str = DEFAULT_OUTPUT_DIR,
     *,
     source_model: str = DEFAULT_SOURCE_MODEL,
+    hidden_size: int = 16,
+    seed: int = 42,
     skip_if_exists: bool = True,
 ) -> str:
     if skip_if_exists and os.path.isfile(os.path.join(output_dir, "model_index.json")):
         return output_dir
-    return build(output_dir, source_model=source_model)
+    return build(output_dir, source_model=source_model, hidden_size=hidden_size, seed=seed)
 
 
 def main() -> None:
@@ -240,11 +242,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.force and os.path.isfile(os.path.join(args.output_dir, "model_index.json")):
-        print(f"tiny Boogu-Image checkpoint already present at {args.output_dir}")
-        return
-    path = build(args.output_dir, source_model=args.source_model, hidden_size=args.hidden_size, seed=args.seed)
-    print(f"tiny Boogu-Image checkpoint written to {path}")
+    path = ensure_tiny_boogu_image_checkpoint(
+        args.output_dir,
+        source_model=args.source_model,
+        hidden_size=args.hidden_size,
+        seed=args.seed,
+        skip_if_exists=not args.force,
+    )
+    print(f"tiny Boogu-Image checkpoint ready at {path}")
 
 
 if __name__ == "__main__":

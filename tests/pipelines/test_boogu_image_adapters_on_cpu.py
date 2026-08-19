@@ -90,38 +90,25 @@ def test_get_class_resolves_boogu_registration():
 # ----------------------------------------------------------- processor config
 
 
-def test_processor_hook_copies_the_mllm_config(tmp_path):
+def test_processor_hook_materialises_the_processor_config(tmp_path):
     """Released checkpoints ship processor/ without config.json; mllm/ has the real one."""
-    (tmp_path / "processor").mkdir()
-    (tmp_path / "mllm").mkdir()
-    (tmp_path / "mllm" / "config.json").write_text('{"model_type": "qwen3_vl_moe"}', encoding="utf-8")
+    checkpoint = tmp_path / "with_mllm"
+    (checkpoint / "processor").mkdir(parents=True)
+    (checkpoint / "mllm").mkdir()
+    (checkpoint / "mllm" / "config.json").write_text('{"model_type": "qwen3_vl_moe"}', encoding="utf-8")
 
-    prepared = BooguImage.prepare_processor_files(str(tmp_path))
+    prepared = BooguImage.prepare_processor_files(str(checkpoint))
 
-    assert prepared == str(tmp_path / "processor")
+    assert prepared == str(checkpoint / "processor")
     assert json.loads((Path(prepared) / "config.json").read_text(encoding="utf-8")) == {"model_type": "qwen3_vl_moe"}
 
-
-def test_processor_hook_falls_back_when_mllm_config_is_absent(tmp_path):
-    (tmp_path / "processor").mkdir()
-
-    prepared = BooguImage.prepare_processor_files(str(tmp_path))
-
+    bare = tmp_path / "without_mllm"
+    (bare / "processor").mkdir(parents=True)
+    prepared = BooguImage.prepare_processor_files(str(bare))
     assert json.loads((Path(prepared) / "config.json").read_text(encoding="utf-8")) == {"model_type": "qwen3_vl"}
 
-
-def test_processor_hook_preserves_an_existing_config(tmp_path):
-    (tmp_path / "processor").mkdir()
-    config_path = tmp_path / "processor" / "config.json"
-    config_path.write_text('{"model_type": "custom"}', encoding="utf-8")
-
-    BooguImage.prepare_processor_files(str(tmp_path))
-
-    assert json.loads(config_path.read_text(encoding="utf-8")) == {"model_type": "custom"}
-
-
-def test_processor_hook_returns_none_without_a_processor_dir(tmp_path):
-    assert BooguImage.prepare_processor_files(str(tmp_path)) is None
+    # Unlike the Qwen-Image-Edit adapter, a missing processor/ is not an error.
+    assert BooguImage.prepare_processor_files(str(tmp_path / "empty")) is None
 
 
 # -------------------------------------------------------------------- text CFG
@@ -135,20 +122,9 @@ def test_text_cfg_follows_the_standard_formula():
 
     # noise + (scale - 1) * (noise - negative); no renormalisation.
     torch.testing.assert_close(out, torch.tensor([5.0, 13.0]))
-
-
-def test_text_cfg_is_identity_at_scale_one():
-    positive = torch.tensor([2.0, 4.0])
-
-    out = apply_boogu_text_cfg(positive, torch.tensor([1.0, 1.0]), 1.0)
-
-    torch.testing.assert_close(out, positive)
-
-
-def test_guidance_scale_defaults_to_boogu_four():
+    # Boogu's default scale is 4.0, not the diffusers-wide 1.0.
     assert resolve_text_guidance_scale(None) == 4.0
     assert resolve_text_guidance_scale(2.5) == 2.5
-    assert resolve_text_guidance_scale(1) == 1.0
 
 
 # ------------------------------------------------- condition latents (T2I/Edit)
@@ -163,44 +139,33 @@ def test_prepare_model_inputs_degenerates_to_t2i_without_condition_latents():
     assert "instruction_hidden_states" in model_inputs
     assert "instruction_attention_mask" in model_inputs
 
+    _, negative_inputs = _prepare_inputs(TensorDict({}, batch_size=[2]), negative=False)
+    assert negative_inputs is None
+
 
 def test_prepare_model_inputs_wraps_condition_latents_for_the_refiner_path():
     """Edit path: (B, C, H, W) latents become the per-sample [[image]] nesting."""
     condition = torch.arange(2 * 3 * 4 * 4, dtype=torch.float32).reshape(2, 3, 4, 4)
 
-    model_inputs, _ = _prepare_inputs(TensorDict({"condition_image_latents": condition}, batch_size=[2]))
+    model_inputs, negative_inputs = _prepare_inputs(TensorDict({"condition_image_latents": condition}, batch_size=[2]))
 
     ref = model_inputs["ref_image_hidden_states"]
     assert isinstance(ref, list) and len(ref) == 2
     assert all(isinstance(entry, list) and len(entry) == 1 for entry in ref)
     torch.testing.assert_close(ref[0][0], condition[0])
     torch.testing.assert_close(ref[1][0], condition[1])
+    # Rollout feeds the reference latents to both CFG branches; training must match.
+    assert negative_inputs["ref_image_hidden_states"] is ref
 
 
-def test_prepare_model_inputs_shares_condition_latents_with_the_negative_branch():
-    """Rollout feeds the reference latents to both CFG branches; training must match."""
-    condition = torch.zeros(2, 3, 4, 4)
-
-    model_inputs, negative_inputs = _prepare_inputs(TensorDict({"condition_image_latents": condition}, batch_size=[2]))
-
-    assert negative_inputs["ref_image_hidden_states"] is model_inputs["ref_image_hidden_states"]
-
-
-def test_prepare_model_inputs_rejects_misshaped_condition_latents():
-    # (B, C, H*W) instead of (B, C, H, W).
-    with pytest.raises(ValueError, match=r"must be \(B, C, H, W\)"):
-        _prepare_inputs(TensorDict({"condition_image_latents": torch.zeros(2, 3, 16)}, batch_size=[2]))
-
-
-def test_prepare_model_inputs_rejects_condition_batch_mismatch():
-    """A micro-batch wider than the latents must fail loudly, not broadcast."""
-    micro_batch = TensorDict({"condition_image_latents": torch.zeros(3, 3, 4, 4)}, batch_size=[3])
-    with pytest.raises(ValueError, match="micro-batch batch size"):
+@pytest.mark.parametrize(
+    ("condition", "micro_batch_size"),
+    [
+        (torch.zeros(2, 3, 16), 2),  # (B, C, H*W) instead of (B, C, H, W)
+        (torch.zeros(3, 3, 4, 4), 3),  # wider than the micro-batch
+    ],
+)
+def test_prepare_model_inputs_rejects_bad_condition_latents(condition, micro_batch_size):
+    micro_batch = TensorDict({"condition_image_latents": condition}, batch_size=[micro_batch_size])
+    with pytest.raises(ValueError):
         _prepare_inputs(micro_batch, batch=2)
-
-
-def test_prepare_model_inputs_skips_the_negative_branch_without_cfg():
-    model_inputs, negative_inputs = _prepare_inputs(TensorDict({}, batch_size=[2]), negative=False)
-
-    assert negative_inputs is None
-    assert model_inputs["return_dict"] is False

@@ -36,12 +36,4 @@ run_test 5 "Diffusion OPD actor+ref+teacher e2e" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" SMOKE=coexistence \
     bash tests/special_e2e/run_diffusion_teacher_smoke.sh
 
-run_test 6 "FlowGRPO Boogu-Image trainer e2e" \
-    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
-    bash tests/special_e2e/run_flowgrpo_boogu_image.sh
-
-run_test 7 "FlowGRPO Boogu-Image-Edit trainer e2e" \
-    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
-    bash tests/special_e2e/run_flowgrpo_boogu_image_edit.sh
-
 gpu_smoke_summary

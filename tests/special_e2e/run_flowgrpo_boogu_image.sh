@@ -1,34 +1,62 @@
 #!/usr/bin/env bash
 # FlowGRPO Boogu-Image e2e smoke test (minimal runtime), vllm_omni rollout.
 #
+# MODE=t2i (default)  text-to-image path.
+# MODE=edit           TI2I editing path; additionally exercises the reference
+#                     latents (condition image -> ref_image_hidden_states
+#                     refiner) branch.
+#
 # Single pass covering:
 #   parquet load -> vllm_omni rollout (BooguImagePipelineWithLogProb) ->
 #   jpeg_compressibility rule reward -> flow_grpo -> FSDP LoRA -> sync.
 #
-# Requires: vllm-omni (>= Boogu support), the `boogu-image` package
-#   (canonical transformer for the training side; the checkpoint's
-#   transformer_boogu.py is a re-export shim),
-#   tiny Boogu-Image at ~/models/tiny-random/Boogu-Image
-#   (see tests/special_e2e/build_boogu_image_tiny_random.py).
+# Requires: vllm-omni (>= Boogu support), the `boogu-image` package (canonical
+#   transformer for the training side; the checkpoint's transformer_boogu.py is
+#   a re-export shim), and a locally cached Boogu/Boogu-Image-0.1-Base -- the
+#   tiny checkpoint is built from it below (processor/scheduler are copied
+#   verbatim). Base and Edit share the pipeline architecture, so one tiny
+#   checkpoint serves both modes. Point SOURCE_MODEL at a local directory when
+#   the base checkpoint is not in the Hugging Face cache.
 set -euo pipefail
 
-# Override via env: NUM_GPUS, MODEL_PATH, DATA_DIR, TOTAL_TRAIN_STEPS,
-#                   TRAIN_FILES, VAL_FILES
+# Override via env: MODE, NUM_GPUS, MODEL_PATH, SOURCE_MODEL, DATA_DIR,
+#                   TOTAL_TRAIN_STEPS, TRAIN_FILES, VAL_FILES
+MODE=${MODE:-t2i}
 NUM_GPUS=${NUM_GPUS:-4}
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/tiny-random/Boogu-Image}
+SOURCE_MODEL=${SOURCE_MODEL:-Boogu/Boogu-Image-0.1-Base}
 TOKENIZER_PATH=${TOKENIZER_PATH:-${MODEL_PATH}/processor}
-DATA_DIR=${DATA_DIR:-${HOME}/data/dummy_diffusion}
+
+case "${MODE}" in
+    t2i)
+        DATA_DIR=${DATA_DIR:-${HOME}/data/dummy_diffusion}
+        TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-2}
+        max_prompt_length=256
+        experiment_name=flowgrpo-boogu-image-e2e
+        ;;
+    edit)
+        DATA_DIR=${DATA_DIR:-${HOME}/data/dummy_boogu_image_edit}
+        TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-1}
+        max_prompt_length=512
+        experiment_name=flowgrpo-boogu-image-edit-e2e
+        ;;
+    *)
+        echo "FAIL: unknown MODE='${MODE}' (expected 't2i' or 'edit')."
+        exit 1
+        ;;
+esac
+
 dummy_train_path=${TRAIN_FILES:-${DATA_DIR}/train.parquet}
 dummy_test_path=${VAL_FILES:-${DATA_DIR}/test.parquet}
-TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-2}
 
 ENGINE=vllm_omni
-max_prompt_length=256
 
+# boogu-image is an optional third-party dependency. Exit 5 (SKIP) rather than
+# fail so its absence does not redden the shared smoke suite for everyone.
 if ! python3 -c 'import boogu' >/dev/null 2>&1; then
-    echo "FAIL: the boogu-image package is required for the training-side transformer."
+    echo "SKIP: the boogu-image package is required for the training-side transformer."
     echo "Install it with: pip install 'boogu-image @ git+https://github.com/boogu-project/Boogu-Image.git'"
-    exit 1
+    exit 5
 fi
 
 # The Boogu rollout pipeline does not support FA3-style backends selection;
@@ -42,10 +70,24 @@ micro_bsz=$((micro_bsz_per_gpu * NUM_GPUS))
 mini_bsz=${micro_bsz}
 train_batch_size=$((mini_bsz * n_resp_per_prompt))
 
-python3 tests/special_e2e/create_dummy_diffusion_data.py \
-    --local_save_dir "${DATA_DIR}" \
-    --train_size "${train_batch_size}" \
-    --val_size 4
+# Idempotent: a no-op when the tiny checkpoint is already present.
+python3 tests/special_e2e/build_boogu_image_tiny_random.py \
+    --output-dir "${MODEL_PATH}" \
+    --source-model "${SOURCE_MODEL}"
+
+if [[ "${MODE}" == "edit" ]]; then
+    python3 tests/special_e2e/create_dummy_image_edit_data.py \
+        --local_save_dir "${DATA_DIR}" \
+        --train_size "${train_batch_size}" \
+        --val_size 4 \
+        --image-width 256 \
+        --image-height 256
+else
+    python3 tests/special_e2e/create_dummy_diffusion_data.py \
+        --local_save_dir "${DATA_DIR}" \
+        --train_size "${train_batch_size}" \
+        --val_size 4
+fi
 
 python3 -m verl_omni.trainer.main_diffusion \
     data.train_files=${dummy_train_path} \
@@ -95,7 +137,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     reward.reward_model.enable=False \
     trainer.logger=console \
     trainer.project_name=verl-test \
-    trainer.experiment_name=flowgrpo-boogu-image-e2e \
+    trainer.experiment_name=${experiment_name} \
     trainer.log_val_generations=0 \
     trainer.n_gpus_per_node=${NUM_GPUS} \
     trainer.nnodes=1 \
@@ -106,4 +148,4 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.total_training_steps=${TOTAL_TRAIN_STEPS} \
     "$@"
 
-echo "FlowGRPO Boogu-Image e2e test passed (training completed successfully)."
+echo "FlowGRPO Boogu-Image (MODE=${MODE}) e2e test passed (training completed successfully)."
