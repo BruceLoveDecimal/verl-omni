@@ -17,9 +17,10 @@
 Guards the numerical conventions the rollout shares with training: the velocity
 negation and text CFG that reach ``scheduler.step``, the ``t = 1 - sigma``
 timestep mapping, the float32 sample the SDE step is entitled to, and the
-SDE-window collection contract. A break in any of these keeps generating images -- it only makes the
-rollout log-probs disagree with the training ones -- so an e2e run cannot catch
-it. Training-side conventions live in ``test_boogu_image_adapters_on_cpu.py``.
+SDE-window collection contract. A break in any of these keeps generating
+images — it only makes the rollout log-probs disagree with the training ones —
+so an e2e run cannot catch it. Training-side conventions live in
+``test_boogu_image_adapters_on_cpu.py``.
 """
 
 from types import SimpleNamespace

@@ -59,8 +59,8 @@ if ! python3 -c 'import boogu' >/dev/null 2>&1; then
     exit 5
 fi
 
-# The Boogu rollout pipeline does not support FA3-style backends selection;
-# keep the actor on native attention when FA3 is unavailable.
+# The Boogu path has no FA3 requirement; native/SDPA works everywhere and
+# avoids the Hub fetch of kernels-community/flash-attn3 in sandboxes.
 ATTN_BACKEND=native
 ROLLOUT_ATTN_BACKEND=TORCH_SDPA
 

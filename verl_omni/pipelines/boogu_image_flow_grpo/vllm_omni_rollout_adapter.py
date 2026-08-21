@@ -59,20 +59,14 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
     Extends the vllm-omni ``BooguImagePipeline`` with:
 
     - the :class:`FlowMatchSDEDiscreteScheduler` (diffusers sigma convention;
-      the Boogu 0->1 ascending timesteps map onto it via ``sigma = 1 - t`` and
-      a **negated** velocity — see ``common.py``);
+      see ``common.py`` for the sigma/velocity mapping);
     - ``encode_prompt`` accepting pre-tokenised ``prompt_ids`` from the agent
       loop instead of raw text;
     - an SDE ``diffuse`` loop collecting ``all_latents`` / ``all_log_probs`` /
       ``all_timesteps`` within the SDE window.
 
-    The Base (T2I) and Edit (TI2I) checkpoints share this architecture string;
-    one adapter serves both. Edit requests carry a single reference image,
-    which is VAE-encoded at near-native resolution (align_res: the output
-    resolution follows the reference) and threaded through the transformer's
-    ``ref_image_hidden_states`` refiner path; the VLM copy uses the
-    checkpoint processor's own sizing so the image-placeholder count matches
-    the pre-tokenised prompt.
+    Base (T2I) and Edit (TI2I) checkpoints share this architecture string, so
+    one adapter serves both; Edit requests simply carry a reference image.
     """
 
     supports_request_batch = False
@@ -122,13 +116,9 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
             attention_mask = torch.ones_like(prompt_ids, dtype=torch.long)
         attention_mask = attention_mask.unsqueeze(0) if attention_mask.ndim == 1 else attention_mask
 
-        # Only run the vision tower when the prompt actually carries image
-        # placeholder tokens. The engine's dummy warm-up run injects a synthetic
-        # image for every ``support_image_input`` pipeline (Boogu declares that
-        # for the shared Edit path), but its prompt_ids hold no placeholders —
-        # feeding pixel_values there produces image features with no matching
-        # tokens ("tokens: 0, features: N"). This guard also fails safe on any
-        # placeholder/pixel-grid desync between the preprocessor and rollout.
+        # Skip the vision tower unless the prompt carries image placeholder
+        # tokens: the engine warm-up injects a synthetic image without any,
+        # which would crash on unmatched features ("tokens: 0, features: N").
         encoder_kwargs = {}
         image_token_id = getattr(self.mllm.config, "image_token_id", None)
         has_image_tokens = image_token_id is not None and bool((prompt_ids == image_token_id).any())
@@ -136,10 +126,9 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
             image_inputs = self.processor.image_processor(images=condition_images, return_tensors="pt")
             encoder_kwargs["pixel_values"] = image_inputs["pixel_values"].to(device=self.device, dtype=self.mllm.dtype)
             encoder_kwargs["image_grid_thw"] = image_inputs["image_grid_thw"].to(self.device)
-            # transformers >= 5.x Qwen3VL requires per-token modality ids
-            # alongside pixel_values for M-RoPE (0 = text, 1 = image); the
-            # processor normally returns them next to input_ids, so rebuild
-            # them here from the pre-tokenised prompt.
+            # transformers >= 5.x Qwen3VL wants per-token modality ids for
+            # M-RoPE (0 = text, 1 = image); rebuild them from the pre-tokenised
+            # prompt, since we bypass the processor call that returns them.
             encoder_kwargs["mm_token_type_ids"] = (prompt_ids == image_token_id).long().to(self.device)
 
         with torch.no_grad():
@@ -296,11 +285,8 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
                 all_timesteps.append(timestep_value)
 
         if not all_timesteps:
-            # Degenerate SDE window (e.g. the engine warm-up / dummy run, which
-            # denoises with a single step so no ``i`` satisfies
-            # ``sde_window[0] <= i < sde_window[1]``). No trajectory to record;
-            # the caller ships None-safe trajectory fields. Real rollouts always
-            # have ``sde_window_size >= 1`` and collect at least one step.
+            # Degenerate window (e.g. the engine's single-step warm-up run):
+            # nothing was collected, and the caller ships None-safe fields.
             return latents, None, None, None
 
         stacked_latents = torch.stack(all_latents, dim=1)
@@ -476,7 +462,7 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
             ref_image_hidden_states=ref_image_hidden_states,
         )
 
-        # Decode (upstream post-VAE normalisation and optional resize-back).
+        # Decode the way upstream does: undo the VAE scaling/shift, resize back.
         output_type = sampling_params.output_type or "pil"
         if output_type == "latent":
             image = latents

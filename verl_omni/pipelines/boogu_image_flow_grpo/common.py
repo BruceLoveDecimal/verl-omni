@@ -17,7 +17,6 @@
 The rollout adapter (vllm-omni) and the training adapter (diffusers) must
 handle Boogu-Image with identical conventions — otherwise the rollout
 trajectory and the training-time log-probs diverge and RL silently breaks.
-Those shared conventions live in this module.
 
 Convention differences
 ----------------------

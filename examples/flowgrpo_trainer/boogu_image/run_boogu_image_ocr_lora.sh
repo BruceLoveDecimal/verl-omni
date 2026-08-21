@@ -14,22 +14,18 @@
 # named transformer_blocks.*, so LoRA weight-sync collection gathers 0 params
 # without it.
 #
-# Settings this script deliberately leaves at their defaults, because whether
-# they are needed depends on the box rather than on Boogu:
+# Left at defaults on purpose — whether they are needed depends on the box,
+# not on Boogu:
 #   attn_backend=native, rollout_attn_backend=TORCH_SDPA
-#       The Boogu path has no FA3 requirement, so these are safe to set, and
-#       they are the fix if the transformer fails at construction time trying
-#       to fetch kernels-community/flash-attn3 from the Hub (no egress, or
-#       remote code not trusted). Where the kernel does load, the default is
-#       the faster choice.
+#       No FA3 requirement on this path; set these if the transformer fails to
+#       fetch kernels-community/flash-attn3 from the Hub (no egress / untrusted
+#       remote code). Where the kernel loads, the default is faster.
 #   reward.reward_model.rollout.max_model_len=8192
-#       Qwen3-VL advertises a 262144 context; if vLLM reports that the KV cache
-#       reservation exceeds the reward engine's share of GPU memory, cap it.
-#       OCR scoring needs a small fraction of that context.
+#       Qwen3-VL advertises a 262144 context; cap it if the KV-cache reservation
+#       exceeds the reward engine's GPU share. OCR scoring needs far less.
 #   actor.fsdp_config.param_offload / optimizer_offload
-#       Offload targets the GPU-poor/CPU-rich case. Colocating rollout,
-#       training and reward on one node makes host RAM the binding constraint
-#       instead, so on a single 80GB+ card turn both off.
+#       Offload targets the GPU-poor/CPU-rich case; on a single 80GB+ card,
+#       colocation makes host RAM the constraint instead — turn both off.
 set -x
 
 # Set WORKSPACE to any writable directory; defaults to $HOME
