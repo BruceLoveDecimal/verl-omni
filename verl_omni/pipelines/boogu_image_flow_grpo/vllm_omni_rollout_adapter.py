@@ -15,7 +15,7 @@
 """Boogu-Image vLLM-Omni rollout adapter for FlowGRPO (T2I and Edit/TI2I)."""
 
 import os
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +28,18 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from verl_omni.pipelines.diffusion_rollout_output import rollout_output, wrap_rollout_postprocessor
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import QwenImageTokenIdPromptMixin, coalesce_not_none
+from verl_omni.pipelines.request_batch import (
+    collate_prompt_mask as _collate_prompt_mask,
+)
+from verl_omni.pipelines.request_batch import (
+    collate_prompt_rows as _collate_prompt_rows,
+)
+from verl_omni.pipelines.request_batch import (
+    sample_per_sample_sde_windows as _sample_per_sample_sde_windows,
+)
+from verl_omni.pipelines.request_batch import (
+    split_diffusion_output_by_request as _split_diffusion_output_by_request,
+)
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 from verl_omni.pipelines.utils import ImageGenerationRequest
 
@@ -67,9 +79,14 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
 
     Base (T2I) and Edit (TI2I) checkpoints share this architecture string, so
     one adapter serves both; Edit requests simply carry a reference image.
+
+    T2I requests are served packed: without that the engine clamps
+    ``max_num_seqs`` to 1 and every rollout image costs a separate forward.
+    Edit falls back to one request at a time because its output size follows
+    each request's own reference image.
     """
 
-    supports_request_batch = False
+    supports_request_batch = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
@@ -208,6 +225,55 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
                 prompt_ids, prompt_mask = self._tokenize_text_prompt(p0)
         return prompt_ids, prompt_mask, negative_prompt_ids, negative_prompt_mask
 
+    def _collate_prompt_batch(self, prompts):
+        """Pack every request's pre-tokenised prompt into one padded ``(N, L)`` grid.
+
+        Falls back to :meth:`_extract_prompt_ids` for raw-text prompts, which
+        only the engine warm-up sends and which never arrive packed.
+        """
+        prompt_ids, token_lengths = _collate_prompt_rows(
+            prompts,
+            ("prompt_token_ids", "prompt_ids"),
+            None,
+            device=self.device,
+            field_name="prompt_token_ids",
+        )
+        if prompt_ids is None:
+            return self._extract_prompt_ids(prompts)
+
+        prompt_mask = _collate_prompt_mask(
+            prompts,
+            ("prompt_mask",),
+            None,
+            device=self.device,
+            field_name="prompt_mask",
+            token_lengths=token_lengths,
+            target_seq_len=int(prompt_ids.shape[1]),
+        )
+        negative_prompt_ids, negative_token_lengths = _collate_prompt_rows(
+            prompts,
+            ("negative_prompt_ids",),
+            None,
+            device=self.device,
+            field_name="negative_prompt_ids",
+        )
+        negative_prompt_mask = _collate_prompt_mask(
+            prompts,
+            ("negative_prompt_mask",),
+            None,
+            device=self.device,
+            field_name="negative_prompt_mask",
+            token_lengths=negative_token_lengths,
+            target_seq_len=None if negative_prompt_ids is None else int(negative_prompt_ids.shape[1]),
+        )
+        # Both the Qwen3VL encoder and the Boogu transformer were fed a long
+        # mask before packing; the collate helper hands back bool.
+        if prompt_mask is not None:
+            prompt_mask = prompt_mask.long()
+        if negative_prompt_mask is not None:
+            negative_prompt_mask = negative_prompt_mask.long()
+        return prompt_ids, prompt_mask, negative_prompt_ids, negative_prompt_mask
+
     # ------------------------------------------------------------------
     # SDE denoising loop
     # ------------------------------------------------------------------
@@ -223,9 +289,9 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
         timesteps: torch.Tensor,
         guidance_scale: float,
         noise_level: float,
-        sde_window: tuple[int, int],
+        sde_window: tuple[int, int] | list[tuple[int, int]],
         sde_type: str,
-        generator: torch.Generator | None,
+        generator: torch.Generator | list[torch.Generator] | None,
         logprobs: bool,
         ref_image_hidden_states: list | None = None,
     ):
@@ -236,25 +302,40 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
         Boogu velocity, which is negated before every ``scheduler.step``.
         Latents stay fp32 in storage; casts to model dtype happen only for the
         transformer forward (see common_pitfalls: float32 trajectory rule).
+
+        ``sde_window`` is either one window shared by the batch or one per
+        packed row. Per-row windows are what let packed requests keep the
+        trajectory each would have drawn alone: a row outside its own window
+        sees ``noise_level`` 0 while its neighbours are still diffusing.
         """
-        all_latents: list[torch.Tensor] = []
-        all_log_probs: list[torch.Tensor] = []
-        all_timesteps: list[torch.Tensor] = []
+        batch_size = latents.shape[0]
+        windows = [sde_window] * batch_size if isinstance(sde_window, tuple) else list(sde_window)
+        if len(windows) != batch_size:
+            raise ValueError(f"Expected {batch_size} SDE windows, got {len(windows)}.")
+        if len({end - start for start, end in windows}) != 1:
+            raise ValueError("Packed SDE windows must share the same size.")
+
+        all_latents: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+        all_log_probs: list[list[Any]] = [[] for _ in range(batch_size)]
+        all_timesteps: list[list[Any]] = [[] for _ in range(batch_size)]
         self.scheduler.set_begin_index(0)
 
         do_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
         num_train_timesteps = self.scheduler.config.num_train_timesteps
 
         for i, timestep_value in enumerate(timesteps):
-            if i < sde_window[0]:
-                cur_noise_level = 0.0
-            elif i == sde_window[0]:
-                cur_noise_level = noise_level
-                all_latents.append(latents.float())
-            elif i < sde_window[1]:
-                cur_noise_level = noise_level
-            else:
-                cur_noise_level = 0.0
+            for batch_idx, (start, _end) in enumerate(windows):
+                if i == start:
+                    all_latents[batch_idx].append(latents[batch_idx].detach().float().clone())
+
+            levels = [float(noise_level) if start <= i < end else 0.0 for start, end in windows]
+            cur_noise_level: float | torch.Tensor = (
+                levels[0]
+                if all(level == levels[0] for level in levels)
+                else torch.tensor(levels, device=latents.device, dtype=torch.float32).view(
+                    batch_size, *([1] * (latents.ndim - 1))
+                )
+            )
 
             boogu_t = boogu_timestep_from_scheduler(timestep_value, num_train_timesteps)
             x = latents.to(prompt_embeds.dtype)
@@ -279,21 +360,24 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
                 return_dict=False,
             )
 
-            if sde_window[0] <= i < sde_window[1]:
-                all_latents.append(latents.to(torch.float32))
-                all_log_probs.append(log_prob)
-                all_timesteps.append(timestep_value)
+            for batch_idx, (start, end) in enumerate(windows):
+                if start <= i < end:
+                    all_latents[batch_idx].append(latents[batch_idx].detach().to(torch.float32).clone())
+                    all_log_probs[batch_idx].append(None if log_prob is None else log_prob[batch_idx])
+                    all_timesteps[batch_idx].append(timestep_value)
 
-        if not all_timesteps:
+        if not any(all_timesteps):
             # Degenerate window (e.g. the engine's single-step warm-up run):
             # nothing was collected, and the caller ships None-safe fields.
             return latents, None, None, None
 
-        stacked_latents = torch.stack(all_latents, dim=1)
+        stacked_latents = torch.stack([torch.stack(row, dim=0) for row in all_latents], dim=0)
         stacked_log_probs = (
-            torch.stack(all_log_probs, dim=1) if all_log_probs and all_log_probs[0] is not None else None
+            torch.stack([torch.stack(row, dim=0) for row in all_log_probs], dim=0)
+            if all_log_probs[0] and all_log_probs[0][0] is not None
+            else None
         )
-        stacked_timesteps = torch.stack(all_timesteps).unsqueeze(0).expand(latents.shape[0], -1)
+        stacked_timesteps = torch.stack([torch.stack(row, dim=0) for row in all_timesteps], dim=0)
         return latents, stacked_latents, stacked_log_probs, stacked_timesteps
 
     # ------------------------------------------------------------------
@@ -317,6 +401,26 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
         # Parent preprocessing supplies VAE tensors; Qwen3VL still needs the raw
         # image whose pixel grid matches the pre-tokenised placeholders.
         _, preprocessed_images = self._extract_reference_images(prompts)
+        has_reference = any(image is not None for image in preprocessed_images)
+
+        # Edit (TI2I) sizes its output from each request's own reference image,
+        # so packed Edit requests cannot share one latent grid. Serve them one
+        # at a time; only T2I takes the packed path below.
+        if has_reference and request_batch.num_reqs > 1:
+            return [
+                self.forward(
+                    request,
+                    noise_level=noise_level,
+                    sde_window_size=sde_window_size,
+                    sde_window_range=sde_window_range,
+                    sde_type=sde_type,
+                    logprobs=logprobs,
+                )
+                for request in request_batch.requests
+            ]
+
+        # Only the Edit path reads images off the prompt, and it is unpacked by
+        # the branch above, so the first prompt is the only one that carries them.
         custom_prompt = prompts[0] if prompts else {}
         condition_images: list = []
         if isinstance(custom_prompt, dict):
@@ -327,11 +431,10 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
                 f"Boogu-Image editing supports a single reference image; received {len(condition_images)}."
             )
         condition_images = [image.convert("RGB") for image in condition_images]
-        has_reference = any(image is not None for image in preprocessed_images)
         if has_reference != bool(condition_images):
             raise ValueError("Boogu-Image Edit requires both raw and parent-preprocessed reference images.")
 
-        prompt_ids, prompt_mask, negative_prompt_ids, negative_prompt_mask = self._extract_prompt_ids(prompts)
+        prompt_ids, prompt_mask, negative_prompt_ids, negative_prompt_mask = self._collate_prompt_batch(prompts)
 
         if isinstance(prompt_ids, list):
             prompt_ids = torch.tensor(prompt_ids, device=self.device)
@@ -362,9 +465,18 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
         sde_type = coalesce_not_none(extra.get("sde_type", None), sde_type)
         logprobs = coalesce_not_none(extra.get("logprobs", None), logprobs)
 
-        generator = sampling_params.generator
-        if generator is None and sampling_params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(sampling_params.seed)
+        if request_batch.num_reqs > 1:
+            # One RNG per packed request, so a row draws the same latents and
+            # SDE window it would have drawn running alone.
+            for request in request_batch.requests:
+                request_params = request.sampling_params
+                if request_params.generator is None and request_params.seed is not None:
+                    request_params.generator = torch.Generator(device=self.device).manual_seed(request_params.seed)
+            generator = request_batch.collate_request_generators(num_images_per_prompt, None)
+        else:
+            generator = sampling_params.generator
+            if generator is None and sampling_params.seed is not None:
+                generator = torch.Generator(device=self.device).manual_seed(sampling_params.seed)
 
         batch_size = prompt_ids.shape[0] if prompt_ids.ndim == 2 else 1
         if has_reference and batch_size != 1:
@@ -431,17 +543,14 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
         )
         timesteps = self.scheduler.timesteps
 
-        if sde_window_size is not None:
-            start = torch.randint(
-                sde_window_range[0],
-                sde_window_range[1] - sde_window_size + 1,
-                (1,),
-                generator=generator,
-                device=self.device,
-            ).item()
-            sde_window = (start, start + sde_window_size)
-        else:
-            sde_window = (0, len(timesteps) - 1)
+        sde_window = _sample_per_sample_sde_windows(
+            sde_window_size=sde_window_size,
+            sde_window_range=sde_window_range if sde_window_range is not None else (0, 5),
+            num_timesteps=len(timesteps),
+            batch_size=latents.shape[0],
+            generator=generator,
+            device=self.device,
+        )
 
         freqs_cis = get_boogu_freqs_cis(self.transformer.axes_dim_rope, self.transformer.axes_lens)
 
@@ -492,4 +601,9 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
             rl=None if condition_image_latents is None else {"condition_image_latents": condition_image_latents},
             to_cpu=True,
         )
-        return [result] if return_batch else result
+        outputs = _split_diffusion_output_by_request(
+            result,
+            request_batch,
+            num_outputs_per_prompt=num_images_per_prompt,
+        )
+        return outputs if return_batch else outputs[0]

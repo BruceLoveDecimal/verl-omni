@@ -37,10 +37,13 @@ NUM_TRAIN_TIMESTEPS = 1000
 class _RecordingScheduler:
     """Stand-in for FlowMatchSDEDiscreteScheduler that records every step call."""
 
-    def __init__(self, step_dtype=torch.float32) -> None:
+    def __init__(self, step_dtype=torch.float32, noise_coupled=False) -> None:
         self.config = SimpleNamespace(num_train_timesteps=NUM_TRAIN_TIMESTEPS)
         self.begin_index = None
         self.step_dtype = step_dtype
+        # Fold noise_level into the step so a packed row's trajectory actually
+        # depends on the window it was given, not just on the step index.
+        self.noise_coupled = noise_coupled
         self.calls: list[SimpleNamespace] = []
 
     def set_begin_index(self, index) -> None:
@@ -57,13 +60,16 @@ class _RecordingScheduler:
             )
         )
         log_prob = torch.full((sample.shape[0],), float(len(self.calls))) if kwargs["return_logprobs"] else None
-        return (sample + 1.0).to(self.step_dtype), log_prob, None, None
+        stepped = sample + 1.0
+        if self.noise_coupled:
+            stepped = stepped + kwargs["noise_level"]
+        return stepped.to(self.step_dtype), log_prob, None, None
 
 
-def _make_pipeline(predictions, step_dtype=torch.float32):
+def _make_pipeline(predictions, step_dtype=torch.float32, noise_coupled=False):
     """Build an uninitialised pipeline whose ``predict`` replays ``predictions``."""
     pipeline = object.__new__(BooguImagePipelineWithLogProb)
-    pipeline.scheduler = _RecordingScheduler(step_dtype)
+    pipeline.scheduler = _RecordingScheduler(step_dtype, noise_coupled)
     pipeline.predict_calls = []
     values = list(predictions)
 
@@ -77,8 +83,16 @@ def _make_pipeline(predictions, step_dtype=torch.float32):
     return pipeline
 
 
-def _diffuse(pipeline, *, timesteps, sde_window, guidance_scale=1.0, negative=False, noise_level=1.2, dtype=None):
-    batch = 2
+def _levels(noise_level, batch=2):
+    """Per-row noise levels, whether the loop emitted a shared float or a tensor."""
+    if isinstance(noise_level, torch.Tensor):
+        return noise_level.flatten().tolist()
+    return [noise_level] * batch
+
+
+def _diffuse(
+    pipeline, *, timesteps, sde_window, guidance_scale=1.0, negative=False, noise_level=1.2, dtype=None, batch=2
+):
     embeds = torch.zeros(batch, 5, 8, dtype=dtype or torch.float32)
     mask = torch.ones(batch, 5, dtype=torch.long)
     return BooguImagePipelineWithLogProb.diffuse(
@@ -224,6 +238,82 @@ def test_rollout_degenerate_window_reports_no_trajectory():
     assert latents.shape == (2, 3, 2, 2)
 
 
+# ------------------------------------------------------- packed request batching
+
+
+def test_rollout_declares_request_batching():
+    """Without the flag the engine clamps max_num_seqs to 1 and serialises rollout."""
+    assert BooguImagePipelineWithLogProb.supports_request_batch is True
+
+
+def test_rollout_noises_each_packed_row_over_its_own_window():
+    pipeline = _make_pipeline([torch.zeros(2, 3, 2, 2)])
+    timesteps = torch.tensor([900.0, 800.0, 700.0, 600.0, 500.0])
+
+    _diffuse(pipeline, timesteps=timesteps, sde_window=[(0, 2), (2, 4)], noise_level=1.2)
+
+    levels = [call.noise_level for call in pipeline.scheduler.calls]
+
+    # A step where the rows disagree carries a per-row tensor; where they agree
+    # the loop keeps the cheaper shared float.
+    assert [isinstance(level, torch.Tensor) for level in levels] == [True, True, True, True, False]
+    assert [_levels(level) for level in levels] == [
+        pytest.approx([1.2, 0.0]),
+        pytest.approx([1.2, 0.0]),
+        pytest.approx([0.0, 1.2]),
+        pytest.approx([0.0, 1.2]),
+        pytest.approx([0.0, 0.0]),
+    ]
+
+
+def test_rollout_collects_each_packed_row_over_its_own_window():
+    pipeline = _make_pipeline([torch.zeros(2, 3, 2, 2)])
+    timesteps = torch.tensor([900.0, 800.0, 700.0, 600.0, 500.0])
+
+    _, all_latents, all_log_probs, all_timesteps = _diffuse(pipeline, timesteps=timesteps, sde_window=[(0, 2), (2, 4)])
+
+    assert all_latents.shape == (2, 3, 3, 2, 2)
+    torch.testing.assert_close(all_timesteps[0], torch.tensor([900.0, 800.0]))
+    torch.testing.assert_close(all_timesteps[1], torch.tensor([700.0, 600.0]))
+    # Each row records the latent it entered its own window with, then one per step.
+    assert [all_latents[0, k].flatten()[0].item() for k in range(3)] == pytest.approx([0.0, 1.0, 2.0])
+    assert [all_latents[1, k].flatten()[0].item() for k in range(3)] == pytest.approx([2.0, 3.0, 4.0])
+    # Log-probs are indexed per row, so each keeps the steps inside its window.
+    torch.testing.assert_close(all_log_probs, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+
+
+def test_packed_rows_match_the_same_windows_run_alone():
+    """Packing must not move a row's trajectory: the training-side recompute
+    replays these latents, so a shift here silently breaks the log-prob ratio."""
+    timesteps = torch.tensor([900.0, 800.0, 700.0, 600.0, 500.0])
+    windows = [(0, 2), (2, 4)]
+
+    packed = _make_pipeline([torch.zeros(2, 3, 2, 2)], noise_coupled=True)
+    _, packed_latents, packed_log_probs, packed_timesteps = _diffuse(packed, timesteps=timesteps, sde_window=windows)
+
+    for row, window in enumerate(windows):
+        alone = _make_pipeline([torch.zeros(1, 3, 2, 2)], noise_coupled=True)
+        _, latents, log_probs, row_timesteps = _diffuse(alone, timesteps=timesteps, sde_window=window, batch=1)
+        torch.testing.assert_close(packed_latents[row : row + 1], latents)
+        torch.testing.assert_close(packed_log_probs[row : row + 1], log_probs)
+        torch.testing.assert_close(packed_timesteps[row : row + 1], row_timesteps)
+
+
+def test_rollout_rejects_one_window_per_row_mismatch():
+    pipeline = _make_pipeline([torch.zeros(2, 3, 2, 2)])
+
+    with pytest.raises(ValueError, match="SDE windows"):
+        _diffuse(pipeline, timesteps=torch.tensor([900.0, 800.0]), sde_window=[(0, 1)])
+
+
+def test_rollout_rejects_packed_windows_of_different_sizes():
+    """Ragged windows would leave the rows with trajectories that cannot stack."""
+    pipeline = _make_pipeline([torch.zeros(2, 3, 2, 2)])
+
+    with pytest.raises(ValueError, match="same size"):
+        _diffuse(pipeline, timesteps=torch.tensor([900.0, 800.0, 700.0]), sde_window=[(0, 1), (1, 3)])
+
+
 # --------------------------------------------------------------- prompt plumbing
 
 
@@ -255,3 +345,42 @@ def test_extract_prompt_ids_returns_nothing_without_prompts():
     pipeline = object.__new__(BooguImagePipelineWithLogProb)
 
     assert pipeline._extract_prompt_ids([]) == (None, None, None, None)
+
+
+def test_collate_prompt_batch_pads_every_request_into_one_grid():
+    pipeline = object.__new__(BooguImagePipelineWithLogProb)
+    pipeline.device = torch.device("cpu")
+    prompts = [
+        {
+            "prompt_token_ids": [1, 2, 3],
+            "prompt_mask": [1, 1, 1],
+            "negative_prompt_ids": [7, 8],
+            "negative_prompt_mask": [1, 1],
+        },
+        {
+            "prompt_token_ids": [4, 5],
+            "prompt_mask": [1, 1],
+            "negative_prompt_ids": [7, 8],
+            "negative_prompt_mask": [1, 1],
+        },
+    ]
+
+    prompt_ids, prompt_mask, negative_ids, negative_mask = pipeline._collate_prompt_batch(prompts)
+
+    torch.testing.assert_close(prompt_ids, torch.tensor([[1, 2, 3], [4, 5, 0]]))
+    torch.testing.assert_close(prompt_mask, torch.tensor([[1, 1, 1], [1, 1, 0]]))
+    torch.testing.assert_close(negative_ids, torch.tensor([[7, 8], [7, 8]]))
+    torch.testing.assert_close(negative_mask, torch.tensor([[1, 1], [1, 1]]))
+    # The Qwen3VL encoder and the Boogu transformer read a long mask, not a bool.
+    assert prompt_mask.dtype == torch.long
+
+
+def test_collate_prompt_batch_falls_back_to_raw_text():
+    """The engine warm-up sends an untokenised prompt, and never sends it packed."""
+    pipeline = object.__new__(BooguImagePipelineWithLogProb)
+    pipeline.device = torch.device("cpu")
+    pipeline._tokenize_text_prompt = lambda text: (f"ids:{text}", f"mask:{text}")
+
+    prompt_ids, prompt_mask, _, _ = pipeline._collate_prompt_batch([{"prompt": "a cat"}])
+
+    assert (prompt_ids, prompt_mask) == ("ids:a cat", "mask:a cat")
