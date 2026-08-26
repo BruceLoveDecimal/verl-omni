@@ -113,19 +113,25 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     # Initialisation hooks
     # -----------------------------------------------------------------------
 
+    def _init_config(self, config):
+        engine_kwargs = getattr(config, "engine_kwargs", None) or {}
+        omni_kwargs = engine_kwargs.get("vllm_omni", {}) or {}
+        self._ar_mode = omni_kwargs.get("output_mode", "diffusion") == "ar"
+        self._rollout_flags: dict[int, dict] = {}
+        if self._ar_mode:
+            dc = omega_conf_to_dataclass(config, dataclass_type=RolloutConfig)
+        else:
+            dc = omega_conf_to_dataclass(config, dataclass_type=DiffusionRolloutConfig)
+        if getattr(dc, "seed", None) is None:
+            dc.seed = 42
+        return dc
+
     def _init_model_config(self, model_config):
         """AR mode uses OmniModelConfig; diffusion uses DiffusionModelConfig.
 
         Mode is selected by ``engine_kwargs.vllm_omni.output_mode`` ("ar" vs the
         default "diffusion").
         """
-        engine_kwargs = getattr(self.config, "engine_kwargs", None) or {}
-        omni_kwargs = engine_kwargs.get("vllm_omni", {}) or {}
-        # TODO (mike): drop this once the legacy omni training script is removed.
-        # It should be automatically inferred from the model config
-        self._ar_mode = omni_kwargs.get("output_mode", "diffusion") == "ar"
-        self._rollout_flags: dict[int, dict] = {}
-
         if self._ar_mode:
             return omega_conf_to_dataclass(model_config, dataclass_type=OmniModelConfig)
         return omega_conf_to_dataclass(model_config, dataclass_type=DiffusionModelConfig)
@@ -147,6 +153,11 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     # -----------------------------------------------------------------------
     # launch_server hooks
     # -----------------------------------------------------------------------
+
+    def _apply_quantization(self) -> tuple[str | None, dict]:
+        if not self._ar_mode:
+            return None, {}
+        return super()._apply_quantization()
 
     def _get_override_generation_config(self) -> dict:
         """AR mode uses the parent's LLM sampling config; diffusion has none."""
@@ -245,6 +256,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                     "stage_id": sid,
                     "devices": devices,
                     "tensor_parallel_size": tp_size,
+                    "text_encoder_tp_size": getattr(self.config, "text_encoder_tp_size", 1),
                     "engine_extras": adapter_cls.get_stage_engine_extras(sid, pipeline_mode=pipeline_mode),
                 }
                 for sid in stage_ids
@@ -328,8 +340,14 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                     )
                     engine_args["max_num_seqs"] = 1
 
+            engine_args["enable_prompt_embed_cache"] = self.config.enable_prompt_embed_cache
+            engine_args["prompt_embed_cache_size"] = self.config.prompt_embed_cache_size
+
         if getattr(self.config, "step_execution", False):
             engine_args["step_execution"] = True
+
+        if engine_args.get("seed") is None:
+            engine_args.pop("seed", None)
 
         diffusion_master_port, diffusion_master_sock = get_free_port("127.0.0.1", with_alive_sock=True)
         diffusion_master_sock.close()
