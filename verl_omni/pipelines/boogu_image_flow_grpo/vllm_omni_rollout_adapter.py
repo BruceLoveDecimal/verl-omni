@@ -14,6 +14,8 @@
 
 """Boogu-Image vLLM-Omni rollout adapter for FlowGRPO (T2I and Edit/TI2I)."""
 
+from __future__ import annotations
+
 import os
 from typing import Any, Literal
 
